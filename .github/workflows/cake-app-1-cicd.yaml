@@ -1,0 +1,166 @@
+name: cake-app-1-cicd
+
+on:
+  push:
+    paths:
+      - src/**
+    branches:
+      - main
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Super-Linter
+        uses: super-linter/super-linter/slim@v6
+        env:
+          DEFAULT_BRANCH: main
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATE_ALL_CODEBASE: false
+          VALIDATE_JSCPD: false
+          DISABLE_ERRORS: true
+          # Narrow to linters that give real signal on a Python service template.
+          # Disable the ones that are noisy on scaffolded code.
+          VALIDATE_CHECKOV: false
+          VALIDATE_DOCKERFILE_HADOLINT: false
+          VALIDATE_MARKDOWN: false
+          VALIDATE_NATURAL_LANGUAGE: false
+          VALIDATE_PYTHON_BLACK: false
+          VALIDATE_PYTHON_PYLINT: false
+          VALIDATE_PYTHON_FLAKE8: false
+          VALIDATE_PYTHON_ISORT: false
+          VALIDATE_YAML: false
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+          ignore-unfixed: true
+
+  ci:
+    runs-on: ubuntu-latest
+    outputs:
+      commit_id: ${{ steps.commit.outputs.commit_id }}
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shorten commit id
+        id: commit
+        shell: bash
+        run: |
+          echo "commit_id=${GITHUB_SHA::6}" >> "$GITHUB_OUTPUT"
+          echo "COMMIT_ID=${GITHUB_SHA::6}" >> "$GITHUB_ENV"
+      -
+        name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: eweka/cake-app-1:${{ env.COMMIT_ID }}
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          image-ref: eweka/cake-app-1:${{ env.COMMIT_ID }}
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+          ignore-unfixed: true
+
+  cd:
+    needs: ci
+    runs-on: self-hosted
+    steps:
+
+      - uses: actions/checkout@v3
+
+      - name: Modify values file
+        shell: bash
+        run: |
+          echo "${{ needs.ci.outputs.commit_id }}"
+          if ! command -v yq >/dev/null 2>&1; then
+            ARCH=$(uname -m)
+            if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+              YQ_BIN=yq_linux_arm64
+            else
+              YQ_BIN=yq_linux_amd64
+            fi
+            curl -fsSL -o yq "https://github.com/mikefarah/yq/releases/download/v4.44.3/${YQ_BIN}"
+            chmod +x yq
+            sudo mv yq /usr/local/bin/yq
+          fi
+          yq --version
+          yq eval -i '.image.tag = "${{ needs.ci.outputs.commit_id }}"' charts/cake-app-1/values-prod.yaml
+
+      - name: Commit changes
+        uses: EndBug/add-and-commit@v9
+        with:
+          message: "Updates values.yaml with commit ${{ needs.ci.outputs.commit_id }}"
+          pull: '--rebase --autostash'
+          push: 'origin HEAD:main --force-with-lease'
+
+      - name: install argocd
+        shell: bash
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+            FILE=argocd-linux-arm64
+          else
+            FILE=argocd-linux-amd64
+          fi
+
+          rm -f argocd
+          sudo rm -f /usr/local/bin/argocd
+
+          curl -fSL -o argocd "https://github.com/argoproj/argo-cd/releases/latest/download/${FILE}"
+          chmod +x argocd
+          sudo mv argocd /usr/local/bin/argocd
+
+          /usr/local/bin/argocd version --client
+
+      - name: argocd login
+        shell: bash
+        run: |
+          argocd login argocd-server.argocd \
+            --insecure  \
+            --grpc-web \
+            --username admin \
+            --password  ${{ secrets.ARGOCD_PASSWORD }}
+
+      - name: Ensure argocd repo and app
+        shell: bash
+        run: |
+
+          # Connects the argocd repo
+          repo="https://github.com/octal-engine/cake-app-1.git"
+          argocd repo list | grep -q $repo || argocd repo add $repo
+
+          # Creates the argocd app
+          argocd app get cake-app-1 || argocd app create cake-app-1 \
+            --repo $repo \
+            --path charts/cake-app-1 \
+            --dest-namespace prod \
+            --dest-server https://kubernetes.default.svc \
+            --values values-prod.yaml \
+            --revision main \
+            --sync-policy manual \
+            --sync-option CreateNamespace=true
+
+      - name: Argocd app sync
+        shell: bash
+        run: |
+          argocd app sync cake-app-1
+          argocd app wait cake-app-1 --timeout 180
